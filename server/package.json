@@ -1,0 +1,13 @@
+{
+  "name": "llm-chat-backend",
+  "version": "1.0.0",
+  "description": "Backend server for LLM Chat Application",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {}
+}
+
