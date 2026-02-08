@@ -1,0 +1,20 @@
+services:
+  llm-chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      PYTHONUNBUFFERED: 1
+      PORT: 3001
+      # SiliconFlow API 配置（默认）
+      API_BASE_URL: ${API_BASE_URL:-https://api.siliconflow.com/v1}
+      API_KEY: ${API_KEY:-your-siliconflow-key}
+      # 或者使用阿里云千问（可选）
+      ALI_API_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
+      ALI_API_KEY: sk-4a33dceeb78a4a98a25f1945010b76c3
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-your-dashscope-key}
+    restart: unless-stopped
+    volumes:
+      - ./server_python/uploads:/app/server_python/uploads  # 持久化上传文件

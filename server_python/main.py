@@ -11,8 +11,9 @@ from typing import AsyncIterator, Dict, List, Optional
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Header, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from openai import OpenAI
@@ -599,6 +600,22 @@ async def chat_qwen(request: Request):
         "usage": {"completion_tokens": completion_tokens},
         "speed": float(f"{speed:.2f}"),
     }
+
+
+# ========== 静态文件服务：提供前端构建产物 ==========
+# 挂载 dist 目录作为静态文件
+DIST_PATH = Path(__file__).parent.parent / "dist"
+if DIST_PATH.exists():
+    app.mount("/assets", StaticFiles(directory=str(DIST_PATH / "assets")), name="assets")
+    
+    @app.get("/")
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str = ""):
+        """SPA 路由：所有路径返回 index.html"""
+        index_file = DIST_PATH / "index.html"
+        if index_file.exists():
+            return FileResponse(index_file)
+        return JSONResponse({"error": "Frontend not built"}, status_code=404)
 
 
 if __name__ == "__main__":
