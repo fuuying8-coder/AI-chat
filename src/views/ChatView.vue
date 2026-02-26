@@ -53,6 +53,17 @@ onMounted(() => {
 // 是否可作为百炼长文档解析（file-extract）
 const isExtractableDoc = (name: string) => /\.(docx?|pdf|txt|md)$/i.test(name || '')
 
+// 拖拽文件进入时立即执行分片/整文件上传，回调 setResult(fileId, error) 更新输入框内该项状态
+const handleFileDrop = (file: File, setResult: (fileId: string | null, error?: Error) => void) => {
+  if (!isExtractableDoc(file.name)) {
+    setResult(null) // 非文档类型不走上传，仅加入列表
+    return
+  }
+  uploadFileForExtract(file)
+    .then((res) => setResult(res.file_id ?? (res as any).fileId ?? null, undefined))
+    .catch((e) => setResult(null, e instanceof Error ? e : new Error(String(e))))
+}
+
 // 滚动消息容器到底部（流式生成时随内容滚动）
 function scrollToBottom() {
   nextTick(() => {
@@ -94,18 +105,22 @@ const handleSend = async (messageContent:{ text: string; files?: ChatFile[] }) =
     const files = messageContent.files || []
     const docFile = files.find((f) => f.raw && isExtractableDoc(f.name))
     if (docFile) {
-      try {
-        const res = await uploadFileForExtract(docFile.raw)
-        fileId = res.file_id ?? res.fileId ?? null
-        if (!fileId) {
-          console.warn('长文档上传成功但未返回 file_id', res)
+      if (docFile.fileId) {
+        fileId = docFile.fileId
+      } else {
+        try {
+          const res = await uploadFileForExtract(docFile.raw)
+          fileId = res.file_id ?? res.fileId ?? null
+          if (!fileId) {
+            console.warn('长文档上传成功但未返回 file_id', res)
+          }
+        } catch (e) {
+          console.error('长文档上传失败:', e)
+          chatStore.updateLastMessage('长文档上传失败，请重试。')
+          chatStore.setIsLoading(false)
+          chatStore.setLastMessageLoading(false)
+          return
         }
-      } catch (e) {
-        console.error('长文档上传失败:', e)
-        chatStore.updateLastMessage('长文档上传失败，请重试。')
-        chatStore.setIsLoading(false)
-        chatStore.setLastMessageLoading(false)
-        return
       }
     }
 
@@ -328,10 +343,11 @@ const handleRagFileChange = (uploadFile) => {
       </div>
     </div>
 
-    <!-- 聊天输入框 -->
+    <!-- 聊天输入框（支持拖拽文件进入即分片上传） -->
     <div class="chat-input-container">
       <chat-input
         :loading="isLoading"
+        :on-file-drop="handleFileDrop"
         @send="handleSend"
         @stop="handleStop"
       />

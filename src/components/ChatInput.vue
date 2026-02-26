@@ -17,13 +17,18 @@ watch(voice.status, (status) => {
     voice.reset()
   }
 })
-const fileList = ref([]) // 存储上传的文件列表
+const fileList = ref([]) // 存储上传的文件列表，项含 name, url, type, size, raw, uploadStatus?, fileId?, uploadError?
 
-// 定义组件的 props，接收 loading 状态（生成中时发送按钮变为加载/停止）
+// 定义组件的 props
 const props = defineProps({
   loading: {
     type: Boolean,
     default: false,
+  },
+  /** 拖拽文件进入时立即执行上传（分片/整文件），回调 setResult(fileId, error) 更新该项状态 */
+  onFileDrop: {
+    type: Function,
+    default: null,
   },
 })
 
@@ -51,19 +56,61 @@ const handleNewline = (e) => {
   inputValue.value += '\n' // 在当前位置添加换行符
 }
 
-// 处理文件上传（保留 raw 用于 qwen-long 长文档解析上传）
-const handleFileUpload = (uploadFile) => {
-  const file = uploadFile.raw
-  if (!file) return false
-
+// 添加一项到文件列表（uploadStatus: idle 表示点击选择，上传在发送时进行；uploading 表示拖拽进入已触发上传）
+function addFileToList(file, uploadStatus = 'idle') {
   fileList.value.push({
     name: file.name,
     url: URL.createObjectURL(file),
     type: file.type.startsWith('image/') ? 'image' : 'file',
     size: file.size,
-    raw: file, // 用于百炼 file-extract 上传（docx/pdf 等）
+    raw: file,
+    uploadStatus, // 'idle' | 'uploading' | 'success' | 'failed'
+    fileId: null,
+    uploadError: null,
   })
+}
+
+// 处理文件上传（点击选择）：仅加入列表，发送时再上传
+const handleFileUpload = (uploadFile) => {
+  const file = uploadFile.raw
+  if (!file) return false
+  addFileToList(file, 'idle')
   return false // 阻止自动上传
+}
+
+// 拖拽进入：加入列表并立即执行分片/整文件上传
+const handleDrop = (e) => {
+  e.preventDefault()
+  e.stopPropagation()
+  isDragOver.value = false
+  const files = e.dataTransfer?.files
+  if (!files?.length || !props.onFileDrop) return
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i]
+    if (!file) continue
+    addFileToList(file, 'uploading')
+    const setResult = (fileId, error) => {
+      const item = fileList.value.find((x) => x.raw === file)
+      if (item) {
+        item.fileId = fileId ?? null
+        item.uploadStatus = error ? 'failed' : 'success'
+        item.uploadError = error?.message ?? null
+      }
+    }
+    props.onFileDrop(file, setResult)
+  }
+}
+
+const isDragOver = ref(false)
+const handleDragOver = (e) => {
+  e.preventDefault()
+  e.stopPropagation()
+  isDragOver.value = true
+}
+const handleDragLeave = (e) => {
+  e.preventDefault()
+  e.stopPropagation()
+  isDragOver.value = false
 }
 
 // 移除文件
@@ -86,7 +133,13 @@ const handleVoiceToggle = () => {
 </script>
 
 <template>
-  <div class="chat-input-wrapper">
+  <div
+    class="chat-input-wrapper"
+    :class="{ 'is-drag-over': isDragOver }"
+    @dragover.prevent="handleDragOver"
+    @dragleave.prevent="handleDragLeave"
+    @drop.prevent="handleDrop"
+  >
     <!-- 文件预览区域 -->
     <div v-if="fileList.length > 0" class="preview-area">
       <div v-for="file in fileList" :key="file.url" class="preview-item">
@@ -102,6 +155,9 @@ const handleVoiceToggle = () => {
           <el-icon><Document /></el-icon>
           <span class="file-name">{{ file.name }}</span>
           <span class="file-size">{{ (file.size / 1024).toFixed(1) }}KB</span>
+          <span v-if="file.uploadStatus === 'uploading'" class="upload-status uploading">上传中…</span>
+          <span v-else-if="file.uploadStatus === 'success'" class="upload-status success">已就绪</span>
+          <span v-else-if="file.uploadStatus === 'failed'" class="upload-status failed" :title="file.uploadError">失败</span>
           <div class="remove-btn" @click="handleFileRemove(file)">
             <el-icon><Close /></el-icon>
           </div>
@@ -192,6 +248,11 @@ const handleVoiceToggle = () => {
   border-radius: 16px;
   box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
 
+  &.is-drag-over {
+    border-color: var(--el-color-primary);
+    background-color: var(--el-color-primary-light-9, rgba(64, 158, 255, 0.06));
+  }
+
   /* 预览区域容器样式 */
   .preview-area {
     margin-bottom: 8px; /* 与输入框的间距 */
@@ -236,8 +297,22 @@ const handleVoiceToggle = () => {
 
         /* 文件大小样式 */
         .file-size {
-          color: #909399; /* 浅灰色文字 */
-          font-size: 12px; /* 小字体 */
+          color: #909399;
+          font-size: 12px;
+        }
+
+        .upload-status {
+          font-size: 11px;
+          margin-left: 4px;
+          &.uploading {
+            color: var(--el-color-primary);
+          }
+          &.success {
+            color: var(--el-color-success);
+          }
+          &.failed {
+            color: var(--el-color-danger);
+          }
         }
       }
 

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Case Study 服务：查询某药物的 Top-N 关联 miRNA
+Case Study 服务：查询某药物的 Top-N 关联 miRNA（Tool 接口）
 - 加载 drug/miRNA 映射
 - 调用 MGCNA 预测（若依赖可用）
-- 返回带名称的结构化结果
+- 返回带名称的结构化结果，供 Agent 调度与 LLM 润色
 """
 from __future__ import annotations
 
@@ -12,20 +12,21 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# 确保 tools 目录在 path 中，便于导入 data_preprocess5fold、layer3、parms_setting
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from drug_mirna_mappings import drug_id_to_name, drug_id_to_drugbank_id, drug_name_to_id, mirna_id_to_name
 
-# 最优模型路径（优先 global，其次 fold 中最佳）
+# 最优模型路径：优先 global 全量模型，其次 fold 最佳
 BEST_MODEL_GLOBAL = _TOOLS_DIR / "best_model_global.pth"
 BEST_MODEL_FOLD_PATTERN = "best_model_fold*.pth"
 
 
 def _resolve_drug_id(drug: str | int, drug_number: int) -> Tuple[Optional[int], str]:
     """
-    解析 drug 为 drug_id。drug 可以是名称或数字。
+    解析 drug 为 drug_id。drug 可以是药物名称或数字 ID。
     返回 (drug_id, error_msg)，成功时 error_msg 为空。
     """
     drug_id = drug_name_to_id(drug) if isinstance(drug, str) else drug
@@ -38,8 +39,9 @@ def _resolve_drug_id(drug: str | int, drug_number: int) -> Tuple[Optional[int], 
 
 def _load_case_study_predictor():
     """
-    尝试加载 casestudy 的预测逻辑。
-    需要：data_preprocess5fold, layer3, parms_setting 在 tools 或 PYTHONPATH 中。
+    尝试加载 Case Study 的预测逻辑（MGCNA 模型 + 数据）。
+    需要：data_preprocess5fold、layer3、parms_setting 在 tools 或 PYTHONPATH 中。
+    返回 (predictor_dict, error_str)，失败时 predictor_dict 为 None。
     """
     try:
         from data_preprocess5fold import load_data
@@ -49,7 +51,7 @@ def _load_case_study_predictor():
         return None, str(e)
 
     args = settings()
-    # 使用 tools/data 下的数据，避免 /data/pos.edgelist 等绝对路径找不到
+    # 使用 tools/data 下的数据，避免绝对路径找不到
     args.pos_sample = str(_TOOLS_DIR / "data" / "pos.edgelist")
     args.neg_sample = str(_TOOLS_DIR / "data" / "neg.edgelist")
     # Case Study 服务强制使用 CPU，避免 CUDA 依赖与显存占用
@@ -66,7 +68,6 @@ def _load_case_study_predictor():
         hidden2=getattr(args, "hidden2", 16),
         decoder1=getattr(args, "decoder1", 32),
     )
-    # 模型与数据保持在 CPU
     model.to("cpu")
 
     model_path = None
@@ -90,7 +91,7 @@ def _load_case_study_predictor():
 
 
 def _run_predict_all_pairs(predictor: dict, drug_id: int, top_k: int) -> Tuple[List[Tuple[int, int]], List[float]]:
-    """内联 predict_all_pairs 逻辑，避免导入 casestudy 触发训练脚本执行。"""
+    """对指定 drug_id 与全部 miRNA 做预测，按得分排序取 Top-K；返回 (pairs, scores)。"""
     import numpy as np
     import torch
 
@@ -101,6 +102,7 @@ def _run_predict_all_pairs(predictor: dict, drug_id: int, top_k: int) -> Tuple[L
     num_mirnas = getattr(args, "miRNA_number", 1578)
     batch_size = getattr(args, "batch", 256)
 
+    # 构造所有 (mirna_id, drug_id) 对
     all_pairs_list = [[mirna_id, drug_id] for mirna_id in range(num_mirnas)]
     all_pairs_array = np.array(all_pairs_list, dtype=np.int64)
     scores, pairs = [], []
@@ -109,13 +111,11 @@ def _run_predict_all_pairs(predictor: dict, drug_id: int, top_k: int) -> Tuple[L
     with torch.no_grad():
         for i in range(0, len(all_pairs_array), batch_size):
             batch = all_pairs_array[i : i + batch_size]
-            # Case Study 固定 CPU，不使用 .cuda()
             inp = (
                 torch.tensor(batch[:, 0], dtype=torch.long),
                 torch.tensor(batch[:, 1], dtype=torch.long),
             )
             output = model(dataset, inp)
-            # 用 .tolist() 代替 .numpy()，避免 PyTorch 与 NumPy 版本兼容问题
             prob = m(output).detach().cpu().flatten()
             scores.extend(prob.tolist())
             pairs.extend([(int(a), int(b)) for a, b in zip(batch[:, 0], batch[:, 1])])
@@ -135,27 +135,22 @@ def query_drug_top_mirnas(
     top_n: int = 25,
 ) -> Dict[str, Any]:
     """
-    查询某药物的 Top-N 关联 miRNA。
+    Tool 接口：查询某药物的 Top-N 关联 miRNA（MGCNA 预测）。
+    若 MGCNA 未配置则降级为 query_drug_top_mirnas_standalone（返回未就绪提示）。
 
     Args:
         drug: 药物名称或 drug_id
         top_n: 返回前 N 个，默认 25
 
     Returns:
-        {
-            "success": bool,
-            "error": str | None,
-            "drug_id": int | None,
-            "drug_name": str,
-            "top_mirnas": [{"rank", "mirna_id", "mirna_name", "score"}, ...]
-        }
+        success, error, drug_id, drug_name, drugbank_id, top_mirnas: [{ rank, mirna_id, mirna_name, score }]
     """
     result: Dict[str, Any] = {
         "success": False,
         "error": None,
         "drug_id": None,
         "drug_name": "",
-        "drugbank_id": None,  # 药物名称 → DrugBank_ID → 关联 miRNA → miRNA name
+        "drugbank_id": None,
         "top_mirnas": [],
     }
 
@@ -201,8 +196,7 @@ def query_drug_top_mirnas_standalone(
 ) -> Dict[str, Any]:
     """
     独立模式：仅使用 drug/miRNA 映射，不依赖 MGCNA 模型。
-    当 data_preprocess5fold / layer3 不可用时，可返回占位结果或调用外部服务。
-    此处返回「服务未就绪」提示，便于前端展示。
+    当 data_preprocess5fold / layer3 不可用时调用，返回「服务未就绪」提示，便于前端或 Agent 展示。
     """
     drug_id = drug_name_to_id(drug) if isinstance(drug, str) else (drug if isinstance(drug, int) else None)
     drug_name = drug_id_to_name(drug_id) if drug_id is not None else str(drug)

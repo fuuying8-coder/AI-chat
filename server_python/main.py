@@ -438,12 +438,13 @@ def _cleanup_stale_chunks():
             pass
 
 
-# ========== RAG 知识库与问答 ==========
+# ========== RAG 知识库与问答（检索-过滤-生成三阶段） ==========
 _kb_service: Optional[KnowledgeBaseService] = None
 _rag_service: Optional[RagService] = None
 
 
 def get_kb_service() -> KnowledgeBaseService:
+    """单例获取知识库服务：分片、向量化、MD5 去重、写入 Chroma。"""
     global _kb_service
     if _kb_service is None:
         _kb_service = KnowledgeBaseService()
@@ -451,6 +452,7 @@ def get_kb_service() -> KnowledgeBaseService:
 
 
 def get_rag_service() -> RagService:
+    """单例获取 RAG 服务：检索-过滤-生成链，限制模型仅基于向量库权威文献作答。"""
     global _rag_service
     if _rag_service is None:
         _rag_service = RagService()
@@ -458,7 +460,7 @@ def get_rag_service() -> RagService:
 
 
 def _extract_text_from_pdf(raw: bytes) -> str:
-    """从 PDF 二进制内容中提取文本。"""
+    """从 PDF 二进制内容中提取文本，供知识库入库。"""
     from io import BytesIO
     from pypdf import PdfReader
     reader = PdfReader(BytesIO(raw))
@@ -474,7 +476,7 @@ def _extract_text_from_pdf(raw: bytes) -> str:
 async def rag_upload(file: UploadFile = File(...)):
     """
     上传文件到 RAG 知识库：读取文本内容，分片向量化并存入向量库（按 MD5 去重）。
-    支持 .txt、.md 纯文本及 .pdf。
+    支持 .txt、.md 纯文本及 .pdf。为「检索-过滤-生成」提供权威文献数据源。
     """
     try:
         raw = await file.read()
@@ -484,7 +486,6 @@ async def rag_upload(file: UploadFile = File(...)):
         if filename.endswith(".pdf") or "pdf" in content_type:
             data = _extract_text_from_pdf(raw)
         else:
-            # 纯文本：优先 utf-8，失败再试 gbk
             try:
                 data = raw.decode("utf-8")
             except UnicodeDecodeError:
@@ -563,7 +564,7 @@ async def rag_list_documents():
 @app.post("/api/chat/rag")
 async def chat_rag(request: Request):
     """
-    RAG 问答：根据知识库检索 + 大模型生成。支持 stream。
+    RAG 问答（三阶段）：检索 → 过滤 → 生成。模型仅基于向量库检索到的权威文献作答。
     请求体：messages, stream, session_id（可选，默认 default）
     """
     body = await request.json()
@@ -576,7 +577,6 @@ async def chat_rag(request: Request):
             status_code=400,
             content={"error": {"message": "messages 不能为空"}},
         )
-    # 最后一条用户消息作为当前问题
     question = None
     for m in reversed(messages):
         if m.get("role") == "user":
@@ -592,7 +592,6 @@ async def chat_rag(request: Request):
     try:
         rag = get_rag_service()
         if stream:
-
             def _rag_stream():
                 try:
                     for chunk in rag.stream(question, session_id):
@@ -619,13 +618,14 @@ async def chat_rag(request: Request):
         )
 
 
-# ========== Case Study：药物 Top-N 关联 miRNA 查询（Agent 工具） ==========
+# ========== Case Study：药物 Top-N 关联 miRNA（Tool 接口 + Agent 调度） ==========
 
 @app.post("/api/case-study/drug-top-mirnas")
 async def case_study_drug_top_mirnas(request: Request):
     """
-    查询某药物的 Top-N 关联 miRNA。
+    直接调用 Tool：查询某药物的 Top-N 关联 miRNA（MGCNA 预测）。
     Body: { "drug": "Docetaxel" | drug_id, "top_n": 25 }
+    供前端或 Agent 直接请求，返回结构化 JSON。
     """
     try:
         body = await request.json()
@@ -666,7 +666,7 @@ async def case_study_list_drugs():
 @app.post("/api/chat/case-study")
 async def chat_case_study(request: Request):
     """
-    Case Study Agent：用户输入自然语言，LLM 提取 drug + top_n 后调用工具，再格式化为回复。
+    Case Study Agent：用户自然语言 → 意图解析（drug、top_n）→ 调用 Tool → 结果格式化 → LLM 推理与润色。
     例：「查询 Docetaxel 的 top 20 关联 miRNA」
     """
     body = await request.json()
@@ -682,20 +682,17 @@ async def chat_case_study(request: Request):
             status_code=400,
             content={"error": {"message": "未找到用户问题"}},
         )
-    # 简单规则提取 drug 和 top_n（可后续替换为 LLM 意图识别）
+    # 意图解析：规则提取 drug 和 top_n（可后续改为 LLM 意图识别或 Function Calling）
     import re
     drug = None
     top_n = 25
-    # 匹配 top N / 前 N 个
     top_match = re.search(r"(?:top|前)\s*(\d+)", question, re.I)
     if top_match:
         top_n = min(int(top_match.group(1)), 200)
-    # 药物名：常见模式
     drug_match = re.search(r"(?:查询|查找|搜索|的药物|的\s*关联)\s*([^\s，,。]+)", question)
     if drug_match:
         drug = drug_match.group(1).strip()
     if not drug:
-        # 尝试直接取第一个名词短语
         parts = re.split(r"[\s，,。]", question)
         for p in parts:
             if len(p) > 1 and not p.isdigit():
@@ -720,7 +717,7 @@ async def chat_case_study(request: Request):
         return JSONResponse(status_code=500, content={"error": {"message": "Case Study 模块未加载"}})
 
     def _build_tool_result_text(result: dict) -> str:
-        """将工具查询结果格式化为供 LLM 使用的文本。"""
+        """Agent 用：将 Tool 返回的结构化结果转为供 LLM 阅读的文本，便于推理与润色。"""
         lines = [
             f"【工具查询结果】",
             f"药物：{result['drug_name']}（ID: {result['drug_id']}，DrugBank: {result.get('drugbank_id') or '-'}）",
