@@ -33,3 +33,11 @@ document.md
 # 分片上传临时与合并结果
 server_python/uploads/
 36_.jpg
+
+# Python 虚拟环境与缓存（避免 "too many active changes"）
+server_python/.venv/
+__pycache__/
+*.pyc
+*.pyo
+server_python/data/
+vue-python-app.tar
