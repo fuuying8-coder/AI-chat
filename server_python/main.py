@@ -3,10 +3,17 @@ import json
 import os
 import re
 import shutil
+import sys
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional
+
+# 保证以 python -m 或从项目根目录运行时，能正确解析 server_python 内模块（如 rag_config）
+_server_dir = Path(__file__).resolve().parent
+if str(_server_dir) not in sys.path:
+    sys.path.insert(0, str(_server_dir))
 
 import httpx
 from dotenv import load_dotenv
@@ -17,6 +24,15 @@ from fastapi.staticfiles import StaticFiles
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from openai import OpenAI
+
+from knowledge_base import KnowledgeBaseService
+from rag import RagService
+from rag_config import uploaded_list_file
+
+# Case Study: 药物 Top-N 关联 miRNA 查询
+_TOOLS_DIR = Path(__file__).resolve().parent / "tools"
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
 
 
 load_dotenv()
@@ -64,7 +80,17 @@ def _chunk_dir(file_hash: str) -> Path:
     return CHUNKS_DIR / file_hash
 
 
-app = FastAPI(title="LLM Chat Python Backend")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """替代已废弃的 on_event("startup")。"""
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+    MERGED_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_chunks()
+    yield
+
+
+app = FastAPI(title="LLM Chat Python Backend", lifespan=lifespan)
 
 # CORS：允许本地前端（5173）访问
 app.add_middleware(
@@ -412,12 +438,349 @@ def _cleanup_stale_chunks():
             pass
 
 
-@app.on_event("startup")
-async def startup_cleanup():
-    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
-    MERGED_DIR.mkdir(parents=True, exist_ok=True)
-    _cleanup_stale_chunks()
+# ========== RAG 知识库与问答 ==========
+_kb_service: Optional[KnowledgeBaseService] = None
+_rag_service: Optional[RagService] = None
+
+
+def get_kb_service() -> KnowledgeBaseService:
+    global _kb_service
+    if _kb_service is None:
+        _kb_service = KnowledgeBaseService()
+    return _kb_service
+
+
+def get_rag_service() -> RagService:
+    global _rag_service
+    if _rag_service is None:
+        _rag_service = RagService()
+    return _rag_service
+
+
+def _extract_text_from_pdf(raw: bytes) -> str:
+    """从 PDF 二进制内容中提取文本。"""
+    from io import BytesIO
+    from pypdf import PdfReader
+    reader = PdfReader(BytesIO(raw))
+    parts = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+@app.post("/api/rag/upload")
+async def rag_upload(file: UploadFile = File(...)):
+    """
+    上传文件到 RAG 知识库：读取文本内容，分片向量化并存入向量库（按 MD5 去重）。
+    支持 .txt、.md 纯文本及 .pdf。
+    """
+    try:
+        raw = await file.read()
+        filename = (file.filename or "unknown").lower()
+        content_type = (file.content_type or "").lower()
+
+        if filename.endswith(".pdf") or "pdf" in content_type:
+            data = _extract_text_from_pdf(raw)
+        else:
+            # 纯文本：优先 utf-8，失败再试 gbk
+            try:
+                data = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                data = raw.decode("gbk", errors="replace")
+
+        if not (data and data.strip()):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "文件内容为空或无法解析出文本"}},
+            )
+        kb = get_kb_service()
+        msg = kb.upload_by_str(data.strip(), file.filename or "unknown")
+        filename = file.filename or "unknown"
+        uploaded_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        record = {"filename": filename, "uploaded_at": uploaded_at, "message": msg}
+        uploaded_list_file.parent.mkdir(parents=True, exist_ok=True)
+        if uploaded_list_file.exists():
+            try:
+                list_data = json.loads(uploaded_list_file.read_text(encoding="utf-8"))
+            except Exception:
+                list_data = []
+        else:
+            list_data = []
+        list_data.append(record)
+        uploaded_list_file.write_text(json.dumps(list_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"success": True, "message": msg, "filename": filename}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e)}},
+        )
+
+
+def _list_documents_from_chroma():
+    """从 Chroma 向量库读取已入库的文档名（按 source 去重），供前端展示。"""
+    try:
+        kb = get_kb_service()
+        coll = kb.chroma._collection
+        result = coll.get(include=["metadatas"])
+        metadatas = result.get("metadatas") or []
+        seen = {}
+        for m in metadatas:
+            if not m or not isinstance(m, dict):
+                continue
+            source = m.get("source")
+            if not source:
+                continue
+            create_time = m.get("create_time") or ""
+            if source not in seen or create_time > seen[source]:
+                seen[source] = create_time
+        return [
+            {"filename": name, "uploaded_at": t, "message": "已入库"}
+            for name, t in seen.items()
+        ]
+    except Exception:
+        return []
+
+
+@app.get("/api/rag/documents")
+async def rag_list_documents():
+    """返回已上传到知识库的文档列表。优先读 JSON 记录，为空则从 Chroma 拉取。"""
+    list_data = []
+    if uploaded_list_file.exists():
+        try:
+            raw = uploaded_list_file.read_text(encoding="utf-8")
+            list_data = json.loads(raw) if raw.strip() else []
+            if not isinstance(list_data, list):
+                list_data = []
+        except Exception:
+            list_data = []
+    if not list_data:
+        list_data = _list_documents_from_chroma()
+    return {"documents": list_data}
+
+
+@app.post("/api/chat/rag")
+async def chat_rag(request: Request):
+    """
+    RAG 问答：根据知识库检索 + 大模型生成。支持 stream。
+    请求体：messages, stream, session_id（可选，默认 default）
+    """
+    body = await request.json()
+    messages = body.get("messages", [])
+    stream = body.get("stream", True)
+    session_id = (body.get("session_id") or body.get("sessionId") or "default").strip()
+
+    if not messages:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "messages 不能为空"}},
+        )
+    # 最后一条用户消息作为当前问题
+    question = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            question = m.get("content") or ""
+            break
+    if not (question and question.strip()):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "未找到用户问题"}},
+        )
+    question = question.strip()
+
+    try:
+        rag = get_rag_service()
+        if stream:
+
+            def _rag_stream():
+                try:
+                    for chunk in rag.stream(question, session_id):
+                        if chunk:
+                            yield _sse_data({"choices": [{"delta": {"content": chunk, "reasoning_content": ""}}]})
+                    yield _sse_data("[DONE]")
+                except Exception as e:
+                    yield _sse_data({"error": {"message": str(e)}})
+
+            return StreamingResponse(
+                _rag_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+        content = rag.invoke(question, session_id)
+        return {
+            "choices": [{"message": {"content": content or "", "reasoning_content": ""}}],
+            "usage": {"completion_tokens": len((content or "").split())},
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e)}},
+        )
+
+
+# ========== Case Study：药物 Top-N 关联 miRNA 查询（Agent 工具） ==========
+
+@app.post("/api/case-study/drug-top-mirnas")
+async def case_study_drug_top_mirnas(request: Request):
+    """
+    查询某药物的 Top-N 关联 miRNA。
+    Body: { "drug": "Docetaxel" | drug_id, "top_n": 25 }
+    """
+    try:
+        body = await request.json()
+        drug = body.get("drug")
+        top_n = int(body.get("top_n", 25))
+        if drug is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "缺少 drug 参数（药物名称或 ID）"}},
+            )
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": f"请求体解析失败: {e}"}, "success": False},
+        )
+    try:
+        from case_study_service import query_drug_top_mirnas
+        result = query_drug_top_mirnas(drug=drug, top_n=top_n)
+        return result
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(e)}, "success": False},
+        )
+
+
+@app.get("/api/case-study/drugs")
+async def case_study_list_drugs():
+    """返回可查询的药物名称列表，供前端/LLM 参考。"""
+    try:
+        from drug_mirna_mappings import list_drug_names
+        names = list_drug_names()
+    except ImportError:
+        names = []
+    return {"drugs": names}
+
+
+@app.post("/api/chat/case-study")
+async def chat_case_study(request: Request):
+    """
+    Case Study Agent：用户输入自然语言，LLM 提取 drug + top_n 后调用工具，再格式化为回复。
+    例：「查询 Docetaxel 的 top 20 关联 miRNA」
+    """
+    body = await request.json()
+    messages = body.get("messages", [])
+    stream = body.get("stream", True)
+    question = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            question = (m.get("content") or "").strip()
+            break
+    if not question:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "未找到用户问题"}},
+        )
+    # 简单规则提取 drug 和 top_n（可后续替换为 LLM 意图识别）
+    import re
+    drug = None
+    top_n = 25
+    # 匹配 top N / 前 N 个
+    top_match = re.search(r"(?:top|前)\s*(\d+)", question, re.I)
+    if top_match:
+        top_n = min(int(top_match.group(1)), 200)
+    # 药物名：常见模式
+    drug_match = re.search(r"(?:查询|查找|搜索|的药物|的\s*关联)\s*([^\s，,。]+)", question)
+    if drug_match:
+        drug = drug_match.group(1).strip()
+    if not drug:
+        # 尝试直接取第一个名词短语
+        parts = re.split(r"[\s，,。]", question)
+        for p in parts:
+            if len(p) > 1 and not p.isdigit():
+                drug = p
+                break
+    if not drug:
+        content = "请明确指定药物名称，例如：查询 Docetaxel 的 top 20 关联 miRNA。"
+        if stream:
+            def _stream():
+                yield _sse_data({"choices": [{"delta": {"content": content, "reasoning_content": ""}}]})
+                yield _sse_data("[DONE]")
+            return StreamingResponse(
+                _stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+        return {"choices": [{"message": {"content": content}}]}
+
+    try:
+        from case_study_service import query_drug_top_mirnas
+    except ImportError:
+        return JSONResponse(status_code=500, content={"error": {"message": "Case Study 模块未加载"}})
+
+    def _build_tool_result_text(result: dict) -> str:
+        """将工具查询结果格式化为供 LLM 使用的文本。"""
+        lines = [
+            f"【工具查询结果】",
+            f"药物：{result['drug_name']}（ID: {result['drug_id']}，DrugBank: {result.get('drugbank_id') or '-'}）",
+            f"Top {len(result['top_mirnas'])} 关联 miRNA 预测（排名、miRNA 名称、得分）：",
+        ]
+        for r in result["top_mirnas"]:
+            lines.append(f"  {r['rank']}. {r['mirna_name']} (ID: {r['mirna_id']}), 得分: {r['score']:.4f}")
+        return "\n".join(lines)
+
+    _SYSTEM_PROMPT_CASE_STUDY = """你是药物- miRNA 关联分析助手。用户会收到一次「Case Study 工具」的查询结果（药物名称、Top-N 关联 miRNA 及得分）。
+请你在回复中：
+1）准确呈现工具返回的排名与得分数据；
+2）结合你的生物学/药学知识对结果进行推理分析（如可能的意义、相关通路或研究提示）；
+3）用连贯、专业的文字组织成最终回复，既保留数据又体现你的解读与润色。"""
+
+    if stream:
+        async def _stream():
+            yield _sse_data({"choices": [{"delta": {"content": "正在调用 Case Study 工具，查询药物关联 miRNA…", "reasoning_content": ""}}]})
+            result = await asyncio.to_thread(query_drug_top_mirnas, drug=drug, top_n=top_n)
+            if not result.get("success"):
+                yield _sse_data({"choices": [{"delta": {"content": result.get("error", "查询失败"), "reasoning_content": ""}}]})
+                yield _sse_data("[DONE]")
+                return
+            tool_result_text = _build_tool_result_text(result)
+            n = len(result["top_mirnas"])
+            yield _sse_data({"choices": [{"delta": {"content": f"\n正在使用 LLM 结合查询结果进行推理与润色…\n\n", "reasoning_content": ""}}]})
+            user_prompt = f"{tool_result_text}\n\n请结合以上工具查询结果与你的推理能力，写一段回复：准确呈现排名与得分，并给出你的解读、意义或补充说明（润色）。"
+            messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT_CASE_STUDY},
+                {"role": "user", "content": user_prompt},
+            ]
+            try:
+                async for sse_chunk in call_qwen_stream_langchain(messages):
+                    yield sse_chunk
+            except Exception as e:
+                yield _sse_data({"choices": [{"delta": {"content": f"\n\nLLM 推理失败: {e}。原始结果：\n{tool_result_text}", "reasoning_content": ""}}]})
+                yield _sse_data("[DONE]")
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    # 非流式：工具结果 + 一次 LLM 推理与润色
+    result = await asyncio.to_thread(query_drug_top_mirnas, drug=drug, top_n=top_n)
+    if not result.get("success"):
+        content = result.get("error", "查询失败")
+        return {"choices": [{"message": {"content": content}}]}
+    tool_result_text = _build_tool_result_text(result)
+    user_prompt = f"{tool_result_text}\n\n请结合以上工具查询结果与你的推理能力，写一段回复：准确呈现排名与得分，并给出你的解读、意义或补充说明（润色）。"
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT_CASE_STUDY},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        content = await call_qwen_with_langchain(messages)
+    except Exception as e:
+        content = f"LLM 推理失败: {e}。原始结果：\n{tool_result_text}"
+    return {"choices": [{"message": {"content": content}}]}
 
 
 async def call_qwen_with_langchain(

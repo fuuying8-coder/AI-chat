@@ -5,7 +5,7 @@ import { Plus } from '@element-plus/icons-vue'
 import { computed, ref, watch, nextTick, onMounted } from 'vue'
 import { useChatStore } from '@/stores/chat'
 import { messageHandler } from '@/utils/messageHandler'
-import { createChatCompletion, uploadFileForExtract } from '@/utils/api'
+import { createChatCompletion, createRagChatCompletion, createCaseStudyChatCompletion, getRagDocuments, uploadFileForExtract, uploadRagDocument } from '@/utils/api'
 import { useSettingStore } from '@/stores/setting'
 import SettingsPanel from '@/components/SettingsPanel.vue'
 import PopupMenu from '@/components/PopupMenu.vue'
@@ -18,6 +18,18 @@ const currentMessages = computed(() => chatStore.currentMessages)
 const isLoading = computed(() => chatStore.isLoading)
 const settingStore = useSettingStore()
 let abortController: AbortController | null = null
+
+// RAG 模式：为 true 时走知识库检索 + 生成
+const useRagMode = ref(false)
+// Case Study 模式：为 true 时走药物 Top-N 关联 miRNA 查询
+const useCaseStudyMode = ref(false)
+// 知识库上传对话框
+const ragUploadVisible = ref(false)
+const ragUploadLoading = ref(false)
+const ragUploadFile = ref(null)
+const ragUploadResult = ref('')
+const ragDocumentList = ref<{ filename: string; uploaded_at: string; message: string }[]>([])
+const ragDocumentListLoading = ref(false)
 
 
 
@@ -71,8 +83,8 @@ const handleSend = async (messageContent:{ text: string; files?: ChatFile[] }) =
     chatStore.addMessage(
       messageHandler.formatMessage('user', messageContent.text, '', messageContent.files),
     )
-    // 添加空的助手消息
-    chatStore.addMessage(messageHandler.formatMessage('assistant', '', ''))
+    // 添加空的助手消息（loading: true，先显示「内容生成中」，有内容后显示打字机气泡，生成完后显示四个按钮）
+    chatStore.addMessage({ ...messageHandler.formatMessage('assistant', '', ''), loading: true })
 
     chatStore.setIsLoading(true)
     scrollToBottom()
@@ -92,17 +104,30 @@ const handleSend = async (messageContent:{ text: string; files?: ChatFile[] }) =
         console.error('长文档上传失败:', e)
         chatStore.updateLastMessage('长文档上传失败，请重试。')
         chatStore.setIsLoading(false)
+        chatStore.setLastMessageLoading(false)
         return
       }
     }
 
     abortController = new AbortController()
     const useStream = settingStore.settings.stream !== false
-    const response = await createChatCompletion(messages, {
-      fileId: fileId || undefined,
-      stream: useStream,
-      signal: abortController.signal,
-    })
+
+    const response = useCaseStudyMode.value
+      ? await createCaseStudyChatCompletion(messages, {
+          stream: useStream,
+          signal: abortController.signal,
+        })
+      : useRagMode.value
+      ? await createRagChatCompletion(messages, {
+          stream: useStream,
+          signal: abortController.signal,
+          sessionId: chatStore.currentConversationId || 'default',
+        })
+      : await createChatCompletion(messages, {
+          fileId: fileId || undefined,
+          stream: useStream,
+          signal: abortController.signal,
+        })
 
     const isStreamResponse =
       response.body != null && typeof response.body.getReader === 'function'
@@ -127,8 +152,8 @@ const handleSend = async (messageContent:{ text: string; files?: ChatFile[] }) =
     }
   } finally {
     abortController = null
-    // 重置loading状态
     chatStore.setIsLoading(false)
+    chatStore.setLastMessageLoading(false)
   }
 }
 
@@ -173,6 +198,53 @@ const router = useRouter()
 const handleBack = async () => {
   router.push('/')
 }
+
+// 打开知识库上传对话框并拉取已上传文档列表
+const openRagUpload = async () => {
+  ragUploadResult.value = ''
+  ragUploadFile.value = null
+  ragUploadVisible.value = true
+  ragDocumentListLoading.value = true
+  try {
+    const res = await getRagDocuments()
+    ragDocumentList.value = res.documents || []
+  } catch {
+    ragDocumentList.value = []
+  } finally {
+    ragDocumentListLoading.value = false
+  }
+}
+
+// 提交知识库上传（选文件后上传）
+const handleRagUploadSubmit = async () => {
+  if (!ragUploadFile.value) {
+    return
+  }
+  ragUploadLoading.value = true
+  ragUploadResult.value = ''
+  try {
+    const res = await uploadRagDocument(ragUploadFile.value)
+    ragUploadResult.value = res.message || '[成功]已加入知识库'
+    ragDocumentList.value = [
+      ...ragDocumentList.value,
+      {
+        filename: res.filename,
+        uploaded_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+        message: res.message,
+      },
+    ]
+  } catch (e) {
+    ragUploadResult.value = '上传失败：' + (e.message || String(e))
+  } finally {
+    ragUploadLoading.value = false
+  }
+}
+
+// 知识库上传：选择文件
+const handleRagFileChange = (uploadFile) => {
+  const raw = uploadFile?.raw
+  if (raw) ragUploadFile.value = raw
+}
 </script>
 
 <template>
@@ -196,6 +268,31 @@ const handleBack = async () => {
       </div>
 
       <div class="header-right">
+        <el-tooltip content="RAG 知识库问答（开启后将基于已上传文档回答）" placement="top">
+          <button
+            type="button"
+            class="action-btn rag-toggle"
+            :class="{ 'is-active': useRagMode }"
+            @click="useRagMode = !useRagMode; useCaseStudyMode = false"
+          >
+            <span class="rag-label">RAG</span>
+          </button>
+        </el-tooltip>
+        <el-tooltip content="药物 Top-N 关联 miRNA 查询（如：查询 Docetaxel 的 top 20 关联 miRNA）" placement="top">
+          <button
+            type="button"
+            class="action-btn rag-toggle"
+            :class="{ 'is-active': useCaseStudyMode }"
+            @click="useCaseStudyMode = !useCaseStudyMode; useRagMode = false"
+          >
+            <span class="rag-label">Case</span>
+          </button>
+        </el-tooltip>
+        <el-tooltip content="上传文档到知识库（.txt / .md / .pdf）" placement="top">
+          <button type="button" class="action-btn" @click="openRagUpload">
+            <span class="rag-label">知识库</span>
+          </button>
+        </el-tooltip>
         <el-tooltip content="设置" placement="top">
           <button class="action-btn" @click="settingDrawer?.openDrawer()">
             <img src="@/assets/photo/设置.png" alt="settings" />
@@ -245,6 +342,49 @@ const handleBack = async () => {
 
     <!-- 添加对话框组件 -->
     <DialogEdit ref="dialogEdit" />
+
+    <!-- RAG 知识库上传对话框 -->
+    <el-dialog
+      v-model="ragUploadVisible"
+      title="上传到知识库"
+      width="440px"
+      :close-on-click-modal="true"
+    >
+      <div class="rag-dialog-body">
+        <section class="rag-section">
+          <p class="rag-upload-hint">支持 .txt、.md、.pdf 文件，内容将分片向量化并参与 RAG 检索（重复内容按 MD5 去重）。</p>
+          <el-upload
+            :auto-upload="false"
+            :show-file-list="true"
+            :on-change="handleRagFileChange"
+            accept=".txt,.md,.pdf"
+            :limit="1"
+          >
+            <el-button type="primary">选择文件</el-button>
+          </el-upload>
+          <div v-if="ragUploadResult" class="rag-upload-result" :class="{ error: ragUploadResult.startsWith('上传失败') }">
+            {{ ragUploadResult }}
+          </div>
+        </section>
+        <section class="rag-section">
+          <div class="rag-section-title">已有知识库</div>
+          <div v-if="ragDocumentListLoading" class="rag-list-loading">加载中…</div>
+          <ul v-else-if="ragDocumentList.length" class="rag-doc-list">
+            <li v-for="(doc, idx) in ragDocumentList" :key="idx" class="rag-doc-item">
+              <span class="rag-doc-name">{{ doc.filename }}</span>
+              <span class="rag-doc-time">{{ doc.uploaded_at }}</span>
+            </li>
+          </ul>
+          <div v-else class="rag-list-empty">暂无已上传文档，上传后将在此显示</div>
+        </section>
+      </div>
+      <template #footer>
+        <el-button @click="ragUploadVisible = false">取消</el-button>
+        <el-button type="primary" :loading="ragUploadLoading" :disabled="!ragUploadFile" @click="handleRagUploadSubmit">
+          上传
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -379,7 +519,21 @@ const handleBack = async () => {
 
   .header-right {
     display: flex;
+    align-items: center;
     gap: 0.5rem;
+
+    .rag-toggle {
+      font-size: 0.75rem;
+      padding: 0 0.5rem;
+      &.is-active {
+        background-color: #3f7af1;
+        color: #fff;
+        border-radius: 4px;
+      }
+    }
+    .rag-label {
+      white-space: nowrap;
+    }
 
     .action-btn {
       width: 2rem;
@@ -489,5 +643,72 @@ const handleBack = async () => {
   max-width: 796px; /* 设置最大宽度 */
   margin: 0 auto; /* 水平居中 */
   width: 100%; /* 在最大宽度范围内占满宽度 */
+}
+
+.rag-dialog-body {
+  .rag-section {
+    margin-bottom: 1rem;
+    &:last-of-type {
+      margin-bottom: 0;
+    }
+  }
+  .rag-section-title {
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-color-primary);
+    margin-bottom: 0.5rem;
+  }
+  .rag-upload-hint {
+    font-size: 0.85rem;
+    color: var(--text-color-secondary);
+    margin-bottom: 0.75rem;
+  }
+  .rag-upload-result {
+    margin-top: 0.5rem;
+    font-size: 0.9rem;
+    color: #67c23a;
+    &.error {
+      color: #f56c6c;
+    }
+  }
+  .rag-list-loading,
+  .rag-list-empty {
+    font-size: 0.85rem;
+    color: var(--text-color-secondary);
+    padding: 0.5rem 0;
+  }
+  .rag-doc-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 0.25rem 0;
+  }
+  .rag-doc-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.4rem 0.75rem;
+    font-size: 0.85rem;
+    border-bottom: 1px solid var(--border-color);
+    &:last-child {
+      border-bottom: none;
+    }
+  }
+  .rag-doc-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-right: 0.5rem;
+  }
+  .rag-doc-time {
+    color: var(--text-color-secondary);
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
 }
 </style>

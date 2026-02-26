@@ -1,9 +1,22 @@
 <script setup>
-import { ref } from 'vue'
-import { Close, Document, Loading } from '@element-plus/icons-vue'
+import { ref, watch } from 'vue'
+import { Close, Document, Loading, Microphone } from '@element-plus/icons-vue'
+import { useVoiceInput } from '@/voice/useVoiceInput'
 
 // 输入框的值，使用 ref 实现响应式
 const inputValue = ref('')
+
+// 语音输入
+const voice = useVoiceInput({ lang: 'zh-CN', continuous: true, interimResults: true })
+watch(voice.status, (status) => {
+  if (status === 'processing') {
+    const text = voice.getFullTranscript()
+    if (text) {
+      inputValue.value = (inputValue.value ? inputValue.value + '\n' : '') + text
+    }
+    voice.reset()
+  }
+})
 const fileList = ref([]) // 存储上传的文件列表
 
 // 定义组件的 props，接收 loading 状态（生成中时发送按钮变为加载/停止）
@@ -61,6 +74,15 @@ const handleFileRemove = (file) => {
     fileList.value.splice(index, 1)
   }
 }
+
+// 语音输入：生成中禁用；点击切换录音
+const handleVoiceToggle = () => {
+  if (props.loading) return
+  if (!voice.isSupported) {
+    return
+  }
+  voice.toggle()
+}
 </script>
 
 <template>
@@ -91,11 +113,16 @@ const handleFileRemove = (file) => {
       v-model="inputValue"
       type="textarea"
       :autosize="{ minRows: 1, maxRows: 6 }"
-      placeholder="输入消息，Enter 发送，Shift + Enter 换行"
+      :placeholder="voice.isRecording ? voice.statusLabel : '输入消息，Enter 发送，Shift + Enter 换行'"
       resize="none"
       @keydown.enter.exact.prevent="handleSendOrStop"
       @keydown.enter.shift="handleNewline"
     />
+    <!-- 语音状态提示 -->
+    <div v-if="voice.statusLabel || voice.errorMessage" class="voice-status">
+      <span v-if="voice.hasError" class="voice-error">{{ voice.errorMessage }}</span>
+      <span v-else class="voice-hint">{{ voice.statusLabel }}</span>
+    </div>
     <div class="button-group">
       <el-upload
         class="upload-btn"
@@ -119,6 +146,26 @@ const handleFileRemove = (file) => {
           <img src="@/assets/photo/图片.png" alt="picture" />
         </button>
       </el-upload>
+      <el-tooltip
+        :content="
+          !voice.isSupported
+            ? '当前浏览器不支持语音输入'
+            : voice.isRecording
+              ? '点击停止录音'
+              : '语音输入'
+        "
+        placement="top"
+      >
+        <button
+          type="button"
+          class="action-btn voice-btn"
+          :class="{ 'is-recording': voice.isRecording, 'is-disabled': !voice.isSupported }"
+          :disabled="!voice.isSupported || props.loading"
+          @click="handleVoiceToggle"
+        >
+          <el-icon><Microphone /></el-icon>
+        </button>
+      </el-tooltip>
       <div class="divider"></div>
       <button
         type="button"
@@ -217,6 +264,21 @@ const handleFileRemove = (file) => {
     }
   }
 
+  /* 语音状态提示 */
+  .voice-status {
+    font-size: 0.75rem;
+    color: var(--text-color-secondary);
+    min-height: 1rem;
+    margin-top: 2px;
+
+    .voice-error {
+      color: #e74c3c;
+    }
+    .voice-hint {
+      color: #3f7af1;
+    }
+  }
+
   /* 自定义输入框样式 */
   :deep(.el-textarea__inner) {
     border-radius: 8px;
@@ -277,6 +339,22 @@ const handleFileRemove = (file) => {
         background-color: rgba(0, 0, 0, 0.05); /* 悬停时显示浅灰色背景 */
       }
 
+      /* 语音按钮 */
+      &.voice-btn {
+        .el-icon {
+          font-size: 1rem;
+        }
+        &.is-recording {
+          background-color: rgba(231, 76, 60, 0.15);
+          color: #e74c3c;
+          animation: voice-pulse 1.2s ease-in-out infinite;
+        }
+        &.is-disabled {
+          opacity: 0.4;
+          cursor: not-allowed;
+        }
+      }
+
       /* 发送按钮特殊样式 */
       &.send-btn {
         width: 2rem;
@@ -315,5 +393,9 @@ const handleFileRemove = (file) => {
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+@keyframes voice-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
 }
 </style>

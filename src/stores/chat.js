@@ -71,6 +71,15 @@ export const useChatStore = defineStore(
       }
     }
 
+    /** 设置最后一条消息的 loading（生成结束后设为 false，用于隐藏「内容生成中」并显示底部四个按钮） */
+    const setLastMessageLoading = (value) => {
+      if (currentConversation.value?.messages.length > 0) {
+        const lastMessage =
+          currentConversation.value.messages[currentConversation.value.messages.length - 1]
+        lastMessage.loading = value
+      }
+    }
+
     const getLastMessage = () => {
       if (currentConversation.value?.messages.length > 0) {
         return currentConversation.value.messages[currentConversation.value.messages.length - 1]
@@ -112,6 +121,7 @@ export const useChatStore = defineStore(
       addMessage,
       setIsLoading,
       updateLastMessage,
+      setLastMessageLoading,
       getLastMessage,
       createConversation,
       switchConversation,

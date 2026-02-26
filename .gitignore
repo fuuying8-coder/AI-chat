@@ -36,6 +36,7 @@ server_python/uploads/
 
 # Python 虚拟环境与缓存（避免 "too many active changes"）
 server_python/.venv/
+server_python/venv/
 __pycache__/
 *.pyc
 *.pyo

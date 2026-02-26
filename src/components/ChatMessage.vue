@@ -224,13 +224,16 @@ const renderedReasoning = computed(() => {
         </div>
       </div>
 
-      <!-- 消息内容 -->
-      <div v-if="message?.loading && message?.role === 'assistant'" class="thinking-text">
+      <!-- 仅在没有内容时显示「内容生成中」；一旦有流式内容则显示气泡（打字机效果） -->
+      <div
+        v-if="message?.role === 'assistant' && message?.loading && !(message?.content?.trim())"
+        class="thinking-text"
+      >
         <img src="@/assets/photo/加载中.png" alt="loading" class="loading-icon" />
         <span>内容生成中...</span>
       </div>
-      <!-- reasoning toggle button -->
-      <div v-if="message?.reasoning_content" class="reasoning-toggle" @click="toggleReasoning">
+      <!-- reasoning toggle button（生成完成后才显示） -->
+      <div v-if="message?.reasoning_content && !message?.loading" class="reasoning-toggle" @click="toggleReasoning">
         <img :src="thinkingIcon" alt="thinking" />
         <span>深度思考</span>
         <el-icon class="toggle-icon" :class="{ 'is-expanded': isReasoningExpanded }">
@@ -239,12 +242,16 @@ const renderedReasoning = computed(() => {
       </div>
       <!-- reasoning_content -->
       <div
-        v-if="message?.reasoning_content && isReasoningExpanded"
+        v-if="message?.reasoning_content && isReasoningExpanded && !message?.loading"
         class="reasoning markdown-body"
         v-html="renderedReasoning"
       ></div>
-      <!-- content -->
-      <div class="bubble markdown-body" v-html="renderedContent"></div>
+      <!-- 正文气泡：用户消息 或 助手消息（含生成中流式内容，打字机效果） -->
+      <div
+        v-if="message?.role === 'user' || (message?.role === 'assistant' && (message?.content || !message?.loading))"
+        class="bubble markdown-body"
+        v-html="renderedContent"
+      ></div>
       <!-- 只在 AI 助手消息中显示操作按钮和 tokens 信息 -->
       <div v-if="message?.role === 'assistant' && message?.loading === false" class="message-actions">
         <button

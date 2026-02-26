@@ -137,3 +137,114 @@ export const createChatCompletion = async (messages, extraOptions = {}) => {
     throw error
   }
 }
+
+/**
+ * 上传文件到 RAG 知识库（.txt / .md / .pdf），内容会分片向量化并去重
+ * @param {File} file
+ * @returns {Promise<{ success: boolean, message: string, filename: string }>}
+ */
+export const uploadRagDocument = async (file) => {
+  const settingStore = useSettingStore()
+  const form = new FormData()
+  form.append('file', file)
+  const response = await fetch(`${BACKEND_BASE_URL}/api/rag/upload`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${settingStore.settings.apiKeyALi}`,
+    },
+    body: form,
+  })
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}))
+    throw new Error(err.error?.message || `知识库上传失败: ${response.status}`)
+  }
+  return response.json()
+}
+
+/**
+ * 获取已上传到知识库的文档列表（用于「已有知识库」展示）
+ * @returns {Promise<{ documents: Array<{ filename: string, uploaded_at: string, message: string }> }>}
+ */
+export const getRagDocuments = async () => {
+  const settingStore = useSettingStore()
+  const response = await fetch(`${BACKEND_BASE_URL}/api/rag/documents`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${settingStore.settings.apiKeyALi}`,
+    },
+  })
+  if (!response.ok) {
+    throw new Error(`获取知识库列表失败: ${response.status}`)
+  }
+  return response.json()
+}
+
+/**
+ * RAG 问答：基于知识库检索 + 大模型生成
+ * @param {Array} messages
+ * @param {{ stream?: boolean, signal?: AbortSignal, sessionId?: string }} [extraOptions]
+ */
+export const createRagChatCompletion = async (messages, extraOptions = {}) => {
+  const settingStore = useSettingStore()
+  const useStream = extraOptions.stream ?? settingStore.settings.stream ?? true
+  const payload = {
+    messages,
+    stream: useStream,
+    session_id: extraOptions.sessionId || extraOptions.session_id || 'default',
+  }
+  const options = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${settingStore.settings.apiKeyALi}`,
+    },
+    body: JSON.stringify(payload),
+    ...(extraOptions.signal && { signal: extraOptions.signal }),
+  }
+  const response = await fetch(`${BACKEND_BASE_URL}/api/chat/rag`, options)
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || ''
+    if (contentType.includes('application/json')) {
+      const errorData = await response.json().catch(() => ({ error: { message: 'Unknown error' } }))
+      throw new Error(errorData.error?.message || `HTTP error! status: ${response.status}`)
+    }
+    const errorText = await response.text().catch(() => 'Unknown error')
+    throw new Error(`HTTP error! status: ${response.status}, message: ${errorText}`)
+  }
+  if (useStream) return response
+  const data = await response.json()
+  return data
+}
+
+/**
+ * Case Study 问答：药物 Top-N 关联 miRNA 查询
+ * @param {Array} messages
+ * @param {{ stream?: boolean, signal?: AbortSignal }} [extraOptions]
+ */
+export const createCaseStudyChatCompletion = async (messages, extraOptions = {}) => {
+  const settingStore = useSettingStore()
+  const useStream = extraOptions.stream ?? settingStore.settings.stream ?? true
+  const payload = { messages, stream: useStream }
+  const options = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${settingStore.settings.apiKeyALi}`,
+    },
+    body: JSON.stringify(payload),
+    ...(extraOptions.signal && { signal: extraOptions.signal }),
+  }
+  const response = await fetch(`${BACKEND_BASE_URL}/api/chat/case-study`, options)
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || ''
+    if (contentType.includes('application/json')) {
+      const errorData = await response.json().catch(() => ({ error: { message: 'Unknown error' } }))
+      throw new Error(errorData.error?.message || `HTTP error! status: ${response.status}`)
+    }
+    const errorText = await response.text().catch(() => 'Unknown error')
+    throw new Error(`HTTP error! status: ${response.status}, message: ${errorText}`)
+  }
+  if (useStream) return response
+  const data = await response.json()
+  return data
+}
