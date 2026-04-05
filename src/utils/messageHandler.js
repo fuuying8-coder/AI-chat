@@ -12,6 +12,60 @@ export const messageHandler = {
     }
   },
 
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+  },
+
+  _computeBackoffMs(attempt, baseDelayMs, maxDelayMs, jitterRatio) {
+    const exp = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, Math.max(0, attempt - 1)))
+    const jitter = exp * (jitterRatio || 0)
+    const delta = jitter ? (Math.random() * jitter * 2 - jitter) : 0
+    return Math.max(0, Math.round(exp + delta))
+  },
+
+  _isAbortError(err) {
+    return err && (err.name === 'AbortError' || String(err.message || '').includes('aborted'))
+  },
+
+  _isRetryableStreamError(err) {
+    if (!err) return false
+    if (this._isAbortError(err)) return false
+    // fetch/stream interrupted errors vary by browser; keep this permissive
+    const msg = String(err.message || err)
+    return (
+      err instanceof TypeError ||
+      /network|failed to fetch|fetch|stream|connection|socket|terminated|reset/i.test(msg)
+    )
+  },
+
+  _normalizeMessagesForRequest(messages) {
+    const arr = Array.isArray(messages) ? messages.slice() : []
+    // Drop a trailing empty assistant placeholder (common in this app)
+    const last = arr[arr.length - 1]
+    if (last && last.role === 'assistant' && (!last.content || String(last.content).trim() === '')) {
+      arr.pop()
+    }
+    return arr
+  },
+
+  _buildResumeMessages(baseMessages, resumeContent, resumeReasoning, resumeTailChars = 200) {
+    const normalized = this._normalizeMessagesForRequest(baseMessages)
+    const safeContent = String(resumeContent || '')
+    const tail = safeContent.slice(Math.max(0, safeContent.length - resumeTailChars))
+    const resumeUser =
+      '刚才流式输出中断了。请从「已输出内容」的末尾继续续写，不要重复已输出内容。' +
+      '\n若你即将重复，请以“末尾片段”为对齐基准，从其后继续输出。' +
+      `\n\n【已输出内容（截至中断）】\n${safeContent}` +
+      `\n\n【末尾片段（对齐用）】\n${tail}`
+
+    // Put the partial assistant message into history, then ask to continue.
+    return [
+      ...normalized,
+      { role: 'assistant', content: safeContent, ...(resumeReasoning ? { reasoning_content: resumeReasoning } : {}) },
+      { role: 'user', content: resumeUser },
+    ]
+  },
+
   // 处理流式响应
   async handleStreamResponse(response, updateCallback) {
     const reader = response.body.getReader() // 获取流 reader
@@ -121,6 +175,124 @@ export const messageHandler = {
     } catch (error) {
       console.error('Stream processing error:', error)
       throw error
+    }
+  },
+
+  /**
+   * 断线重连版流式处理：
+   * - 自动重试：指数退避 + 抖动
+   * - 续写：把已生成的 assistant 内容带回去，请模型从末尾继续
+   *
+   * @param {(ctx: { attempt: number, resume?: { content: string, reasoning_content: string } }) => Promise<Response>} createResponse
+   * @param {(content: string, reasoning_content: string, tokens: number, speed: number) => void} updateCallback
+   * @param {{ maxRetries?: number, baseDelayMs?: number, maxDelayMs?: number, jitterRatio?: number, resumeTailChars?: number }} [options]
+   */
+  async handleStreamResponseWithReconnect(createResponse, updateCallback, options = {}) {
+    const maxRetries = options.maxRetries ?? 3
+    const baseDelayMs = options.baseDelayMs ?? 500
+    const maxDelayMs = options.maxDelayMs ?? 4000
+    const jitterRatio = options.jitterRatio ?? 0.2
+
+    let accumulatedContent = ''
+    let accumulatedReasoning = ''
+    let tokens = 0
+    let speed = 0
+
+    for (let attempt = 1; attempt <= Math.max(1, maxRetries + 1); attempt++) {
+      try {
+        const response = await createResponse({
+          attempt,
+          resume: attempt === 1 ? undefined : { content: accumulatedContent, reasoning_content: accumulatedReasoning },
+        })
+
+        // Consume this stream; reuse existing parser logic but with external state.
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        const startTime = Date.now()
+
+        // 若重连后上游从头开始重放，这里做“前缀去重”：
+        // 把新流中与已输出 accumulatedContent 的前缀相同部分跳过，直到追平后再追加。
+        let dedupeActive = attempt > 1
+        let matchIndex = 0
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmedLine = line.trim()
+            if (!trimmedLine) continue
+            if (trimmedLine === 'data: [DONE]') continue
+            if (!trimmedLine.startsWith('data: ')) continue
+
+            const jsonStr = trimmedLine.slice(6)
+            if (!jsonStr || jsonStr.trim() === '') continue
+
+            let data
+            try {
+              data = JSON.parse(jsonStr)
+            } catch {
+              continue
+            }
+
+            if (data?.error) {
+              throw new Error(data.error.message || JSON.stringify(data.error))
+            }
+
+            if (data?.choices?.[0]?.delta) {
+              const deltaContent = data.choices[0].delta.content || ''
+              const deltaReasoning = data.choices[0].delta.reasoning_content || ''
+              if (deltaContent) {
+                let toAppend = deltaContent
+
+                if (dedupeActive && accumulatedContent) {
+                  // 逐字符对齐：跳过与 accumulatedContent[matchIndex:] 相同的字符
+                  let i = 0
+                  while (i < toAppend.length && matchIndex < accumulatedContent.length) {
+                    if (toAppend[i] === accumulatedContent[matchIndex]) {
+                      i += 1
+                      matchIndex += 1
+                      continue
+                    }
+                    // 一旦出现不一致，认为上游输出已偏离旧前缀，停止去重，直接追加剩余
+                    dedupeActive = false
+                    break
+                  }
+
+                  if (dedupeActive) {
+                    toAppend = toAppend.slice(i)
+                    if (matchIndex >= accumulatedContent.length) {
+                      dedupeActive = false
+                    }
+                  }
+                }
+
+                if (toAppend) accumulatedContent += toAppend
+              }
+              if (deltaReasoning) accumulatedReasoning += deltaReasoning
+              tokens = data.usage?.completion_tokens || tokens
+              speed = Number(((tokens || 0) / ((Date.now() - startTime) / 1000)).toFixed(2))
+              updateCallback(accumulatedContent, accumulatedReasoning, tokens, speed)
+            }
+          }
+        }
+
+        // finished normally
+        return
+      } catch (err) {
+        if (this._isAbortError(err)) throw err
+        const retryable = this._isRetryableStreamError(err)
+        const isLastAttempt = attempt >= maxRetries + 1
+        if (!retryable || isLastAttempt) {
+          throw err
+        }
+        const delayMs = this._computeBackoffMs(attempt, baseDelayMs, maxDelayMs, jitterRatio)
+        await this._sleep(delayMs)
+      }
     }
   },
 

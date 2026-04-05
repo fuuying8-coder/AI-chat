@@ -1,5 +1,4 @@
 # RAG 服务：检索 - 过滤 - 生成 三阶段，限制模型仅基于向量库检索到的权威文献作答
-from operator import itemgetter
 
 from langchain_community.chat_models.tongyi import ChatTongyi
 from langchain_community.embeddings import DashScopeEmbeddings
@@ -62,12 +61,11 @@ class RagService:
             return format_docs(docs)
 
         # 输入为 dict：input（用户问题）、history（对话历史由 RunnableWithMessageHistory 注入）
+        # 通过 assign 派生 context，保留原有 input/history 字段给 prompt 使用
         chain = (
-            {
-                "context": itemgetter("input") | retrieve_filter_format,  # 从 input 得到 question，执行检索-过滤-格式化
-                "input": itemgetter("input"),
-                "history": itemgetter("history"),
-            }
+            RunnablePassthrough.assign(
+                context=lambda data: retrieve_filter_format(data["input"]),
+            )
             | self.prompt_template
             | self.chat_model
             | StrOutputParser()

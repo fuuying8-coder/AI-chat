@@ -1,7 +1,9 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
 import { Search, ChatLineRound, Document, Setting } from '@element-plus/icons-vue'
-import SearchDialog from '@/components/SearchDialog.vue'
+
+// 延迟加载搜索对话框组件
+const SearchDialog = defineAsyncComponent(() => import('@/components/SearchDialog.vue'))
 
 const searchText = ref('')
 const showSearchDialog = ref(false)
@@ -31,7 +33,8 @@ const handleClickOutside = (event) => {
   }
 }
 
-// 处理快捷键
+// 处理快捷键（防抖）
+let keydownTimeout
 const handleKeydown = (event) => {
   // ESC 关闭对话框
   if (event.key === 'Escape') {
@@ -40,18 +43,23 @@ const handleKeydown = (event) => {
   // Cmd/Ctrl + K 打开对话框
   if ((event.metaKey || event.ctrlKey) && event.key === 'k') {
     event.preventDefault()
-    showSearchDialog.value = true
+    clearTimeout(keydownTimeout)
+    keydownTimeout = setTimeout(() => {
+      showSearchDialog.value = true
+    }, 0)
   }
 }
 
 onMounted(() => {
-  document.addEventListener('click', handleClickOutside)
+  // 使用事件委托降低 click 事件监听器的性能开销
+  document.addEventListener('click', handleClickOutside, true)
   document.addEventListener('keydown', handleKeydown)
 })
 
 onUnmounted(() => {
-  document.removeEventListener('click', handleClickOutside)
+  document.removeEventListener('click', handleClickOutside, true)
   document.removeEventListener('keydown', handleKeydown)
+  clearTimeout(keydownTimeout)
 })
 </script>
 

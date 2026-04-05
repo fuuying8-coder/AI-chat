@@ -100,7 +100,14 @@ const handleSend = async (messageContent:{ text: string; files?: ChatFile[] }) =
     chatStore.setIsLoading(true)
     scrollToBottom()
 
-    const messages = chatStore.currentMessages.map(({ role, content }) => ({ role, content }))
+    // 注意：当前实现会先插入一个空的 assistant 占位消息（loading: true）。
+    // 发给后端时应尽量剔除该空占位，避免干扰模型。
+    const rawMessages = chatStore.currentMessages.map(({ role, content }) => ({ role, content }))
+    const lastMsg = rawMessages[rawMessages.length - 1]
+    const baseMessages =
+      lastMsg && lastMsg.role === 'assistant' && (!lastMsg.content || String(lastMsg.content).trim() === '')
+        ? rawMessages.slice(0, -1)
+        : rawMessages
     let fileId = null
     const files = messageContent.files || []
     const docFile = files.find((f) => f.raw && isExtractableDoc(f.name))
@@ -127,38 +134,75 @@ const handleSend = async (messageContent:{ text: string; files?: ChatFile[] }) =
     abortController = new AbortController()
     const useStream = settingStore.settings.stream !== false
 
-    const response = useCaseStudyMode.value
-      ? await createCaseStudyChatCompletion(messages, {
-          stream: useStream,
-          signal: abortController.signal,
-        })
-      : useRagMode.value
-      ? await createRagChatCompletion(messages, {
-          stream: useStream,
-          signal: abortController.signal,
-          sessionId: chatStore.currentConversationId || 'default',
-        })
-      : await createChatCompletion(messages, {
-          fileId: fileId || undefined,
-          stream: useStream,
-          signal: abortController.signal,
-        })
+    const updateCb = (
+      content: string,
+      reasoning_content: string,
+      tokens: number,
+      speed: number,
+    ) => {
+      chatStore.updateLastMessage(content, reasoning_content, tokens, speed)
+      scrollToBottom()
+    }
 
-    const isStreamResponse =
-      response.body != null && typeof response.body.getReader === 'function'
-    await messageHandler.handleResponse(
-      response,
-      isStreamResponse,
-      (
-        content: string,
-        reasoning_content: string,
-        tokens: number,
-        speed: number
-      ) => {
-        chatStore.updateLastMessage(content, reasoning_content, tokens, speed)
-        scrollToBottom()
-      },
-    )
+    // 流式：支持断线重连（重试 + 续写）。非流式：维持原逻辑。
+    if (useStream) {
+      const createResponse = async ({ attempt, resume }) => {
+        // 注意：RAG/CaseStudy 接口会读取“最后一条 user”作为问题。
+        // 因此这两种模式下断线重连不能追加“继续”的 user 消息，否则会导致意图解析/检索跑偏。
+        // 仅在普通对话（qwen）时使用“带已输出内容续写”的策略。
+        const canResumeByPrompt = !useCaseStudyMode.value && !useRagMode.value
+        const msgs = canResumeByPrompt && resume?.content
+          ? messageHandler._buildResumeMessages(baseMessages, resume.content, resume.reasoning_content)
+          : baseMessages
+
+        // attempt 仅用于调试/埋点时可用，这里不额外输出 UI
+        if (useCaseStudyMode.value) {
+          return await createCaseStudyChatCompletion(msgs, {
+            stream: true,
+            signal: abortController!.signal,
+          })
+        }
+        if (useRagMode.value) {
+          return await createRagChatCompletion(msgs, {
+            stream: true,
+            signal: abortController!.signal,
+            sessionId: chatStore.currentConversationId || 'default',
+          })
+        }
+        return await createChatCompletion(msgs, {
+          fileId: fileId || undefined,
+          stream: true,
+          signal: abortController!.signal,
+        })
+      }
+
+      await messageHandler.handleStreamResponseWithReconnect(createResponse, updateCb, {
+        maxRetries: 3,
+        baseDelayMs: 600,
+        maxDelayMs: 4000,
+        jitterRatio: 0.2,
+      })
+    } else {
+      const response = useCaseStudyMode.value
+        ? await createCaseStudyChatCompletion(baseMessages, {
+            stream: false,
+            signal: abortController.signal,
+          })
+        : useRagMode.value
+        ? await createRagChatCompletion(baseMessages, {
+            stream: false,
+            signal: abortController.signal,
+            sessionId: chatStore.currentConversationId || 'default',
+          })
+        : await createChatCompletion(baseMessages, {
+            fileId: fileId || undefined,
+            stream: false,
+            signal: abortController.signal,
+          })
+
+      // 非流式时 create* 会返回 JSON（见 api.js），这里直接按非流式处理。
+      messageHandler.handleNormalResponse(response, updateCb)
+    }
   } catch (error: unknown) {
     const isAbort = error instanceof Error && error.name === 'AbortError'
     if (!isAbort) {
@@ -179,9 +223,10 @@ const handleRegenerate = async () => {
     if (chatStore.currentMessages.length < 2) {
       return
     }
-    const lastUserMessage = chatStore.currentMessages[chatStore.currentMessages.length - 2] as { content: string; files?: ChatFile[] }
-    // 使用 splice 删除最后两个元素
-    chatStore.currentMessages.splice(-2, 2)
+    // 通过 store 删除最后两条（user + assistant），确保 IndexedDB 同步删除
+    const removed = await chatStore.removeLastMessages(2)
+    const lastUserMessage = (removed?.[0] || null) as null | { content: string; files?: ChatFile[] }
+    if (!lastUserMessage?.content) return
     await handleSend({ text: lastUserMessage.content, files: lastUserMessage.files })
   } catch (error) {
     console.error('Failed to regenerate message:', error)

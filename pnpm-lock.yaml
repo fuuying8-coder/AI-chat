@@ -35,6 +35,9 @@ importers:
       highlight.js:
         specifier: ^11.11.1
         version: 11.11.1
+      idb:
+        specifier: ^8.0.3
+        version: 8.0.3
       lodash-es:
         specifier: ^4.17.21
         version: 4.17.21
@@ -1513,6 +1516,9 @@ packages:
     resolution: {integrity: sha512-+dQSyqPh4x1hlO1swXBiNb2HzTDN1I2IGLQx1GrBuiqFJfoMrnZWwVmatvSiO+Iz8fBUnf+lekwNo4c2LlXItg==}
     engines: {node: '>=14'}
     hasBin: true
+
+  idb@8.0.3:
+    resolution: {integrity: sha512-LtwtVyVYO5BqRvcsKuB2iUMnHwPVByPCXFXOpuU96IZPPoPN6xjOGxZQ74pgSVVLQWtUOYgyeL4GE98BY5D3wg==}
 
   ignore@5.3.2:
     resolution: {integrity: sha512-hsBTNUqQTDwkWtcdYI2i06Y/nUBEsNEDJKjWdigLvegy8kDuJAS8uRlpkkcQpyEXL0Z/pjDy5HBmMjRCJ2gq+g==}
@@ -3855,6 +3861,8 @@ snapshots:
   human-signals@8.0.0: {}
 
   husky@8.0.3: {}
+
+  idb@8.0.3: {}
 
   ignore@5.3.2: {}
 

@@ -29,17 +29,37 @@ export const checkBackendConnection = async () => {
   }
 }
 
-// 在模块加载时检查后端连接
+// 延迟检查后端连接（不阻塞初始页面加载）
 if (typeof window !== 'undefined') {
-  checkBackendConnection().then((result) => {
-    if (result.connected) {
-      console.log('🎉 前端已成功连接到后端服务！')
-      console.log('📍 后端地址:', BACKEND_BASE_URL)
+  // 在应用空闲时异步检查，使用 requestIdleCallback 或 setTimeout
+  const checkConnectionAsync = () => {
+    if (typeof requestIdleCallback !== 'undefined') {
+      requestIdleCallback(() => {
+        checkBackendConnection().then((result) => {
+          if (result.connected) {
+            console.log('🎉 前端已成功连接到后端服务！')
+            console.log('📍 后端地址:', BACKEND_BASE_URL)
+          } else {
+            console.log('⚠️ 后端服务未运行，将使用直接 API 调用模式')
+            console.log('💡 提示: 请运行 `cd server && npm run dev` 启动后端服务')
+          }
+        })
+      })
     } else {
-      console.log('⚠️ 后端服务未运行，将使用直接 API 调用模式')
-      console.log('💡 提示: 请运行 `cd server && npm run dev` 启动后端服务')
+      setTimeout(() => {
+        checkBackendConnection().then((result) => {
+          if (result.connected) {
+            console.log('🎉 前端已成功连接到后端服务！')
+            console.log('📍 后端地址:', BACKEND_BASE_URL)
+          } else {
+            console.log('⚠️ 后端服务未运行，将使用直接 API 调用模式')
+            console.log('💡 提示: 请运行 `cd server && npm run dev` 启动后端服务')
+          }
+        })
+      }, 2000)
     }
-  })
+  }
+  checkConnectionAsync()
 }
 
 
